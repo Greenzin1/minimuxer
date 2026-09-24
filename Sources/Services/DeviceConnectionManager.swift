@@ -71,6 +71,11 @@ actor DeviceConnectionManager {
         let currentProtocol = gateway.pairingFileType
         let currentPort = gateway.servicePort
         var reachable = NetworkUtils.testTCP(ip: ip, port: currentPort, timeoutMs: deviceProbeTimeout)
+        if !reachable {
+            // first probe right after the tunnel comes up can time out on slower
+            // devices — retry once with a more generous timeout before giving up
+            reachable = NetworkUtils.testTCP(ip: ip, port: currentPort, timeoutMs: max(deviceProbeTimeout, 750))
+        }
 
         if !reachable, let resolver = connectionConfigCache?.resolveServicePort {
             let current = ServicePort(protocolType: currentProtocol, port: currentPort)
@@ -204,13 +209,19 @@ actor DeviceConnectionManager {
     }
 
     static func resolveCandidateTunnels(from interfaces: Set<NetInfo>) -> [TunnelNetInfo] {
-        interfaces
+        let utuns = interfaces
             .compactMap { $0 as? TunnelNetInfo }
-            .filter { 
-                $0.tunnelType == .utun && 
-                !$0.interfaceAddresses.v4.isEmpty && $0.interfaceAddresses.v6.isEmpty 
+            .filter {
+                $0.tunnelType == .utun &&
+                !$0.interfaceAddresses.v4.isEmpty
             }
             .sorted { $0.name < $1.name }
+        // prefer IPv4-only utuns (avoids picking e.g. wireguard tunnels), but fall
+        // back to any utun with an IPv4 address when none match — some iOS versions
+        // assign a link-local IPv6 to the LocalDevVPN utun, which made discovery
+        // find nothing at all on iOS 16
+        let strict = utuns.filter { $0.interfaceAddresses.v6.isEmpty }
+        return strict.isEmpty ? utuns : strict
     }
 
     static func resolveCandidatePeers(from interfaces: Set<NetInfo>) -> [CandidatePeer] {
@@ -218,9 +229,12 @@ actor DeviceConnectionManager {
     }
 
     private func resolveLocalVPNTunnel(from interfaces: Set<NetInfo>) async -> (tunnel: TunnelNetInfo?, candidatePeer: CandidatePeer?, isReachable: Bool) {
+        let tunnels = Self.resolveCandidateTunnels(from: interfaces)
+        guard let firstTunnel = tunnels.first else { return (nil, nil, false) }
+
         // pick all candidate peer ips
         let candidates = Self.resolveCandidatePeers(from: interfaces)
-        guard !candidates.isEmpty else { return (nil, nil, false) }
+        guard !candidates.isEmpty else { return (firstTunnel, nil, false) }
 
         // parallelized tcp service port probing on all candidate ips
         let resolved = await withTaskGroup(of: CandidatePeer?.self, returning: CandidatePeer?.self) { group in
@@ -238,7 +252,11 @@ actor DeviceConnectionManager {
             return (resolved.tunnel, resolved, true)
         }
 
-        return (nil, nil, false)
+        // tunnel exists but no candidate passed the probe (yet): keep the tunnel
+        // and best candidate so callers still see the iface/peer instead of
+        // reporting "no local VPN interface" — reachability is retried on the
+        // next refresh (isReady re-runs discovery while the endpoint is unset)
+        return (candidates[0].tunnel, candidates[0], false)
     }
 
     private static func isValidCandidatePeer(_ ip: String, for tunnel: TunnelNetInfo) -> Bool {
@@ -278,6 +296,15 @@ actor DeviceConnectionManager {
         }
         // Priority 3: Point-to-point link layer destination
         addCandidate(tunnel.linkLayerDestinationIP?.v4?.host, mask: "255.255.255.255")
+
+        // Priority 4: conventional LocalDevVPN peers — covers iOS versions where
+        // the route dump / p2p dstaddr yield no candidates for the tunnel iface.
+        // self-addresses are rejected by isValidCandidatePeer, so probing both
+        // sides is safe: only the opposite side can ever pass the tcp probe.
+        if let ifaceIp = tunnel.interfaceAddresses.v4.first?.host, ifaceIp.hasPrefix("10.7.0.") {
+            addCandidate("10.7.0.1", mask: "255.255.255.255")
+            addCandidate("10.7.0.2", mask: "255.255.255.255")
+        }
 
         return candidates
     }

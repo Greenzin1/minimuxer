@@ -92,8 +92,12 @@ final internal class NetworkObserverService: NetworkObserverAPI, @unchecked Send
         let manager = self.connectionManager
         verboseLog("[minimuxer] [net] refreshing interfaces list and peers")
         let ifacesChanged = await manager.refresh()
-        
-        guard ifacesChanged else {
+        let endpointReady = await endpoint.isInitialized
+
+        // re-run the endpoint update whenever the endpoint was never initialized,
+        // even if the interface scan reported no changes — the first path update
+        // often fires before the tunnel peer is reachable (esp. on iOS 16)
+        guard ifacesChanged || !endpointReady else {
             return
         }
         
