@@ -170,6 +170,17 @@ final internal class MinimuxerImpl: MinimuxerAPI {
             return .failure(.pairingNotLoaded("No valid pairing file has been loaded in Minimuxer"))
         }
 
+        // re-run endpoint discovery if the endpoint was never initialized (e.g.
+        // the first network path update fired before the tunnel peer was up)
+        if !(await self.endpoint.isInitialized) {
+            debugLog("[minimuxer] minimuxer endpoint not initialized, refreshing before readiness check")
+            await self.network.refreshEndpoint()
+            if !(await self.endpoint.isInitialized) {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                await self.network.refreshEndpoint()
+            }
+        }
+
         // then check if device is ready
         let deviceIp: String
         do {
